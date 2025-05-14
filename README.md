@@ -46,6 +46,12 @@ cargo install --path .
 OR
 
 ```bash
+LD_LIBRARY_PATH=~/Development/req-processor/target cargo build --release
+```
+
+OR
+
+```bash
 docker image pull ghcr.io/ajmwagar/merino:latest
 ```
 
@@ -53,10 +59,13 @@ docker image pull ghcr.io/ajmwagar/merino:latest
 
 ```bash
 # Start a SOCKS5 Proxy server listening on port 1080 without authentication
-merino --no-auth
+merino --auth-type no-auth
 
 # Use username/password authentication and read users from users.csv
-merino --users users.csv
+socksproxy --users users.csv
+
+# Decide if a user has to be authenticated or not based on the business logic:
+RUST_LOG=trace LD_LIBRARY_PATH=~/Development/req-processor/target/release ./target/release/merino --auth-type smart-auth
 
 # Display a help menu
 merino --help
