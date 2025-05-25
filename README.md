@@ -55,14 +55,26 @@ OR
 docker image pull ghcr.io/ajmwagar/merino:latest
 ```
 
+- To check if a port is open use below command:
+```bash
+telnet <dest-ip> <dest-port>
+netstat -lntu
+ss -lntu
+```
+- Disabling/enabling proxy for some services
+```bash
+sudo vim /etc/apt/apt.conf # Add some code here for disabling/enabling Apt proxy
+vim .docker/config.json # Edit this file for enabling/disabling Docker proxy
+```
+
 ### Usage
 
 ```bash
 # Start a SOCKS5 Proxy server listening on port 1080 without authentication
-merino --auth-type no-auth
+RUST_LOG=trace LD_LIBRARY_PATH=~/Development/req-processor/target/release ./target/release/merino --auth-type no-auth
 
 # Use username/password authentication and read users from users.csv
-socksproxy --users users.csv
+RUST_LOG=trace LD_LIBRARY_PATH=~/Development/req-processor/target/release ./target/release/merino --users users.csv --allow-insecure
 
 # Decide if a user has to be authenticated or not based on the business logic:
 RUST_LOG=trace LD_LIBRARY_PATH=~/Development/req-processor/target/release ./target/release/merino --auth-type smart-auth
@@ -76,6 +88,8 @@ OR
 ```bash
 docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/ajmwagar/merino:latest --no-auth --port=8001
 ```
+
+TODO: In long-time connections (like streams), calculate the usage rate time in shorter intervals.
 
 # 🚥 Roadmap
 

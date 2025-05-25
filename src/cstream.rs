@@ -1,40 +1,55 @@
+use crate::NetUsage;
+use bytes::Bytes;
 use pin_project_lite::pin_project;
 use std::io::Result as IoResult;
-use std::os::raw::c_char;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-#[link(name = "req_processor", kind = "dylib")]
-extern "C" {
-  fn update_usage_rate(username: *const c_char, read_bytes: u64, write_bytes: u64);
-}
-
 pin_project! {
   /// Custom Stream
   /// A custom stream that could calculate usage data and send it to the accouinting system.
   #[derive(Debug)]
-  pub struct CStream<'a, S> {
+  pub struct CStream<S> {
     #[pin] // This ensures that if `S` is !Unpin, `self.inner` gets a `Pin<&mut S>`
     inner: S,
-    write_usage_rate: ByteCount<'a>, // Usage rate of wrote data in bytes
-    read_usage_rate: ByteCount<'a>, // Usage rate of read data in bytes
+    write_usage_rate: ByteCount, // Usage rate of wrote data in bytes
+    read_usage_rate: ByteCount, // Usage rate of read data in bytes
     send_usage: bool, // If true, send usage rate of data to the accounting system
-    username: Option<Vec<u8>>
+    username: Option<Vec<u8>>,
+    net_usage: NetUsage,
   }
 }
 
-impl<'a, S> CStream<'a, S> {
+impl<'a, S> CStream<S> {
   /// Creates a new `ForwardingPrintStream` wrapping the given `inner` stream.
   /// The `prefix` is used in print statements to identify this stream.
-  pub fn new(inner: S, send_usage_data: bool, username: &'a Option<Vec<u8>>) -> Self {
+  pub fn new(
+    inner: S,
+    send_usage_data: bool,
+    username: &'a Option<Vec<u8>>,
+    net_usage: NetUsage,
+  ) -> Self {
     let a = Self {
       inner,
-      read_usage_rate: ByteCount::new("read_bytes".to_string(), send_usage_data, 0, &username),
-      write_usage_rate: ByteCount::new("write_bytes".to_string(), send_usage_data, 1, &username),
+      read_usage_rate: ByteCount::new(
+        "read_bytes".to_string(),
+        send_usage_data,
+        0,
+        username.clone(),
+        net_usage.clone(),
+      ),
+      write_usage_rate: ByteCount::new(
+        "write_bytes".to_string(),
+        send_usage_data,
+        1,
+        username.clone(),
+        net_usage.clone(),
+      ),
       send_usage: send_usage_data,
       username: username.clone(),
+      net_usage,
     };
     a
   }
@@ -51,18 +66,20 @@ pub trait StreamExt {
   fn set_username(&mut self, username: Option<Vec<u8>>);
 }
 
-impl<'a, S> StreamExt for CStream<'a, S> {
+impl<'a, S> StreamExt for CStream<S> {
   fn set_username(&mut self, username: Option<Vec<u8>>) {
     trace!(
-      "Setting username to `{}` (in cstream)",
+      "Set cstream username to `{}`",
       String::from_utf8(username.clone().unwrap_or_else(|| "None".bytes().collect()))
         .unwrap_or_else(|_| "parse-error".to_string())
     );
-    self.username = username;
+    self.username = username.clone();
+    self.read_usage_rate.set_username(username.clone());
+    self.write_usage_rate.set_username(username.clone());
   }
 }
 
-impl<'a, S> AsyncRead for CStream<'a, S>
+impl<S> AsyncRead for CStream<S>
 where
   S: AsyncRead, // The inner stream must be AsyncRead
 {
@@ -81,17 +98,6 @@ where
         let newly_filled_data = &buf.filled()[initial_filled_len..];
         if !newly_filled_data.is_empty() {
           this.read_usage_rate.add(newly_filled_data.len() as i64);
-          // *this.read_bytes. += newly_filled_data.len() as u64;
-          // println!(
-          //   "[{}] READ {} bytes: \"{}\"", // Using lossy UTF-8 for general display
-          //   prefix_str,
-          //   newly_filled_data.len(),
-          //   String::from_utf8_lossy(newly_filled_data)
-          // );
-          // For hex output of binary data, you could use:
-          // print!("[{}] READ {} bytes: ", prefix_str, newly_filled_data.len());
-          // for byte in newly_filled_data { print!("{:02x} ", byte); }
-          // println!();
         } else {
           // 0 bytes read typically means EOF if poll_result is Ok(())
           trace!("READ EOF (0 bytes)");
@@ -109,7 +115,7 @@ where
   }
 }
 
-impl<'a, S> AsyncWrite for CStream<'a, S>
+impl<S> AsyncWrite for CStream<S>
 where
   S: AsyncWrite, // The inner stream must be AsyncWrite
 {
@@ -189,23 +195,31 @@ where
 }
 
 #[derive(Debug)]
-struct ByteCount<'a> {
+struct ByteCount {
   count: Mutex<u64>,
   tag: String,
   /// 0 for read, 1 for write
   byte_type: u8,
-  username: &'a Option<Vec<u8>>,
+  username: Option<Vec<u8>>,
   send_usage: bool,
+  net_usage: NetUsage,
 }
 
-impl<'a> ByteCount<'a> {
-  fn new(tag: String, send_usage: bool, byte_type: u8, username: &Option<Vec<u8>>) -> ByteCount {
+impl ByteCount {
+  fn new(
+    tag: String,
+    send_usage: bool,
+    byte_type: u8,
+    username: Option<Vec<u8>>,
+    net_usage: NetUsage,
+  ) -> ByteCount {
     ByteCount {
       count: Mutex::new(0 as u64),
       tag: tag,
       byte_type: byte_type,
       username: username,
       send_usage: send_usage,
+      net_usage,
     }
   }
   fn get(&self) -> u64 {
@@ -222,28 +236,72 @@ impl<'a> ByteCount<'a> {
   fn set_send_usage(&mut self, send_usage: bool) {
     self.send_usage = send_usage;
   }
+
+  fn set_username(&mut self, username: Option<Vec<u8>>) {
+    self.username = username;
+  }
+
+  // async fn update_usage_rate(&self, username: &Vec<u8>, read_bytes: u64, write_bytes: u64) {
+  //   self
+  //     .net_usage
+  //     .lock()
+  //     .await
+  //     .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes)
+  //     .await;
+  // }
 }
 
-impl Drop for ByteCount<'_> {
+impl Drop for ByteCount {
   fn drop(&mut self) {
     trace!("Destructing {}: {} bytes exchanged.", self.tag, self.get(),);
     trace!(
-      "Send usage rate to the accounting system: {}",
+      "Send usage rate of user {} to the accounting system: {}",
+      match self.username.clone() {
+        None => "None".to_string(),
+        Some(username) => String::from_utf8_lossy(&username).to_string(),
+      },
       self.send_usage
     );
     if self.send_usage {
       let read_bytes = if self.byte_type == 0 { self.get() } else { 0 };
       let write_bytes = if self.byte_type == 1 { self.get() } else { 0 };
-      unsafe {
-        match &self.username {
+      // match &self.username.clone() {
+      //   Some(username) => {
+      //     self
+      //       .net_usage
+      //       .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes);
+      //     // update_usage_rate(username.as_ptr() as *const c_char, read_bytes, write_bytes);
+      //   }
+      //   None => {
+      //     // update_usage_rate(std::ptr::null(), read_bytes, write_bytes);
+      //     self
+      //       .net_usage
+      //       .update_usage_rate(Bytes::from(Vec::new()), read_bytes, write_bytes);
+      //   }
+      // }
+      let username = self.username.clone(); // Clone self.username here
+      let mut net_usage = self.net_usage.clone(); // Clone self.net_usage here
+
+      tokio::spawn(async move {
+        match username {
           Some(username) => {
-            update_usage_rate(username.as_ptr() as *const c_char, read_bytes, write_bytes);
+            match net_usage
+              .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes).await {
+                Ok(_) => (),
+                Err(err) => warn!("Failed to update usage rate for username {}: {}", String::from_utf8_lossy(&username), err),
+                          };
+            // update_usage_rate(username.as_ptr() as *const c_char, read_bytes, write_bytes);
           }
           None => {
-            update_usage_rate(std::ptr::null(), read_bytes, write_bytes);
+            // update_usage_rate(std::ptr::null(), read_bytes, write_bytes);
+            match net_usage
+              .update_usage_rate(Bytes::from(Vec::new()), read_bytes, write_bytes).await{
+                Ok(_) => (),
+                Err(err) => warn!("Failed to update usage rate for username None: {}", err),
+              };
           }
         }
-      }
+      });
     }
   }
 }

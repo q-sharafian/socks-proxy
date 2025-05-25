@@ -6,10 +6,12 @@ extern crate log;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use merino::*;
+use std::env;
 use std::error::Error;
 use std::os::unix::prelude::MetadataExt;
 use std::path::PathBuf;
-use std::env;
+use std::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 
 /// Logo to be printed at when merino is run
 const LOGO: &str = r"
@@ -74,6 +76,8 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+  dotenv::dotenv().ok();
+  
   println!("{}", LOGO);
 
   let opt = Opt::parse();
@@ -167,9 +171,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
   let authed_users = authed_users?;
 
+  let authenticator = Authenticator::new();
+  let dest_checker = DestChecking::new();
+  let net_usage = NetUsage::new();
   // Create proxy server
-  let mut merino = Merino::new(opt.port, &opt.ip, auth_methods, authed_users, None).await?;
-
+  let mut merino = Merino::new(
+    opt.port,
+    &opt.ip,
+    auth_methods,
+    authed_users,
+    None,
+    Mutex::new(authenticator),
+    Mutex::new(dest_checker),
+    net_usage,
+  )
+  .await?;
   // Start Proxies
   merino.serve().await;
   Ok(())
