@@ -1,19 +1,15 @@
-mod authentication;
-mod cache;
+pub mod netguard;
+pub mod cache;
 mod cstream;
 mod socks;
-mod dest_checking;
-mod net_usage;
+pub mod netguard_client;
 
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
 extern crate log;
 
-use core::net;
-
-pub use authentication::Authenticator;
+// pub use netguard::{NetGuard, dummy_netguard::DummyNetGuard};
 pub use cstream::CStream;
 pub use socks::{SocksClient, User, AuthMethods, Merino};
-pub use dest_checking::{DestChecking, DestType};
-pub use net_usage::NetUsage;
+pub use netguard_client::NetGuardClient;

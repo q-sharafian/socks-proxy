@@ -1,8 +1,13 @@
-use crate::NetUsage;
+use crate::NetGuardClient;
+use crate::cache::Cache;
+use crate::netguard::NetGuard;
+use crate::netguard::NetUsage;
+use crate::netguard::SocksAuth;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use std::io::Result as IoResult;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -11,75 +16,68 @@ pin_project! {
   /// Custom Stream
   /// A custom stream that could calculate usage data and send it to the accouinting system.
   #[derive(Debug)]
-  pub struct CStream<S> {
+  pub struct CStream<S, T: NetGuard, U: Cache<SocksAuth, Bytes>> {
     #[pin] // This ensures that if `S` is !Unpin, `self.inner` gets a `Pin<&mut S>`
     inner: S,
-    write_usage_rate: ByteCount, // Usage rate of wrote data in bytes
-    read_usage_rate: ByteCount, // Usage rate of read data in bytes
-    send_usage: bool, // If true, send usage rate of data to the accounting system
-    username: Option<Vec<u8>>,
-    net_usage: NetUsage,
+    usage_rate: ByteCount<T, U>, // A service to send usage rate to the accounting system.
+    is_send_usage: bool, // If true, send usage rate of data to the accounting system
+    username: Option<Bytes>,
+    netguard_client: Arc<NetGuardClient<T, U>>,
   }
 }
 
-impl<'a, S> CStream<S> {
+impl<'a, S, T: NetGuard, U: Cache<SocksAuth, Bytes>> CStream<S, T, U> {
   /// Creates a new `ForwardingPrintStream` wrapping the given `inner` stream.
   /// The `prefix` is used in print statements to identify this stream.
   pub fn new(
     inner: S,
     send_usage_data: bool,
-    username: &'a Option<Vec<u8>>,
-    net_usage: NetUsage,
+    username: Option<Bytes>,
+    netguard_client: Arc<NetGuardClient<T, U>>,
   ) -> Self {
     let a = Self {
       inner,
-      read_usage_rate: ByteCount::new(
-        "read_bytes".to_string(),
+      usage_rate: ByteCount::new(
         send_usage_data,
-        0,
         username.clone(),
-        net_usage.clone(),
+        netguard_client.clone(),
       ),
-      write_usage_rate: ByteCount::new(
-        "write_bytes".to_string(),
-        send_usage_data,
-        1,
-        username.clone(),
-        net_usage.clone(),
-      ),
-      send_usage: send_usage_data,
-      username: username.clone(),
-      net_usage,
+      is_send_usage: send_usage_data,
+      username: username,
+      netguard_client: netguard_client,
     };
     a
   }
 
   /// Set if usage data should be sent or not
   pub fn set_send_usage_data(&mut self, send_usage_data: bool) {
-    self.send_usage = send_usage_data;
-    self.read_usage_rate.set_send_usage(send_usage_data);
-    self.write_usage_rate.set_send_usage(send_usage_data);
+    self.is_send_usage = send_usage_data;
+    self.usage_rate.set_send_usage(send_usage_data);
   }
 }
 
 pub trait StreamExt {
-  fn set_username(&mut self, username: Option<Vec<u8>>);
+  fn set_username(&mut self, username: Option<Bytes>);
 }
 
-impl<'a, S> StreamExt for CStream<S> {
-  fn set_username(&mut self, username: Option<Vec<u8>>) {
+impl<'a, S, T: NetGuard, U: Cache<SocksAuth, Bytes>> StreamExt for CStream<S, T, U> {
+  fn set_username(&mut self, username: Option<Bytes>) {
     trace!(
       "Set cstream username to `{}`",
-      String::from_utf8(username.clone().unwrap_or_else(|| "None".bytes().collect()))
-        .unwrap_or_else(|_| "parse-error".to_string())
+      String::from_utf8(
+        username
+          .clone()
+          .unwrap_or_else(|| "None".bytes().collect())
+          .to_vec()
+      )
+      .unwrap_or_else(|_| "parse-error".to_string())
     );
     self.username = username.clone();
-    self.read_usage_rate.set_username(username.clone());
-    self.write_usage_rate.set_username(username.clone());
+    self.usage_rate.set_username(username.clone());
   }
 }
 
-impl<S> AsyncRead for CStream<S>
+impl<S, T: NetGuard, U: Cache<SocksAuth, Bytes>> AsyncRead for CStream<S, T, U>
 where
   S: AsyncRead, // The inner stream must be AsyncRead
 {
@@ -97,7 +95,9 @@ where
       Poll::Ready(Ok(())) => {
         let newly_filled_data = &buf.filled()[initial_filled_len..];
         if !newly_filled_data.is_empty() {
-          this.read_usage_rate.add(newly_filled_data.len() as i64);
+          this
+            .usage_rate
+            .add_read_rate(newly_filled_data.len() as i64);
         } else {
           // 0 bytes read typically means EOF if poll_result is Ok(())
           trace!("READ EOF (0 bytes)");
@@ -115,7 +115,7 @@ where
   }
 }
 
-impl<S> AsyncWrite for CStream<S>
+impl<S, T: NetGuard, U: Cache<SocksAuth, Bytes>> AsyncWrite for CStream<S, T, U>
 where
   S: AsyncWrite, // The inner stream must be AsyncWrite
 {
@@ -130,14 +130,7 @@ where
     match &poll_result {
       Poll::Ready(Ok(bytes_written)) => {
         if *bytes_written > 0 {
-          this.write_usage_rate.add(*bytes_written as i64);
-          // println!(
-          //   "[{}] WRITE {} bytes (out of {} attempted): \"{}\"",
-          //   prefix_str,
-          //   bytes_written,
-          //   buf.len(),
-          //   String::from_utf8_lossy(&buf[..*bytes_written])
-          // );
+          this.usage_rate.add_write_rate(*bytes_written as i64);
         } else if !buf.is_empty() {
           // Attempted to write data, but 0 bytes were written
           debug!(
@@ -195,65 +188,75 @@ where
 }
 
 #[derive(Debug)]
-struct ByteCount {
-  count: Mutex<u64>,
-  tag: String,
-  /// 0 for read, 1 for write
-  byte_type: u8,
-  username: Option<Vec<u8>>,
+/// A data structure that keeps track of the number of bytes read or written by a
+/// stream and send them to the accounting system.
+struct ByteCount<T: NetGuard, U: Cache<SocksAuth, Bytes>> {
+  read_rate: Mutex<u64>,
+  /// In bytes
+  write_rate: Mutex<u64>,
+  /// In bytes
+  username: Option<Bytes>,
+  /// If true, send usage rate of data to the accounting system
   send_usage: bool,
-  net_usage: NetUsage,
+  netguard_client: Arc<NetGuardClient<T, U>>,
 }
 
-impl ByteCount {
+impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
   fn new(
-    tag: String,
     send_usage: bool,
-    byte_type: u8,
-    username: Option<Vec<u8>>,
-    net_usage: NetUsage,
-  ) -> ByteCount {
+    username: Option<Bytes>,
+    netguard_client: Arc<NetGuardClient<T, U>>,
+  ) -> ByteCount<T, U> {
     ByteCount {
-      count: Mutex::new(0 as u64),
-      tag: tag,
-      byte_type: byte_type,
-      username: username,
-      send_usage: send_usage,
-      net_usage,
+      read_rate: Mutex::new(0),
+      write_rate: Mutex::new(0),
+      username,
+      send_usage,
+      netguard_client: netguard_client,
     }
   }
-  fn get(&self) -> u64 {
-    *self.count.lock().unwrap()
+  /// Get net usage
+  fn get(&self) -> NetUsage {
+    NetUsage {
+      read_rate: *self.read_rate.lock().unwrap(),
+      write_rate: *self.write_rate.lock().unwrap(),
+    }
   }
-  // Add bytes to the count. Value could be positive or negative
-  fn add(&self, bytes: i64) {
+
+  /// Add read usage. `bytes` could be positive or negative
+  fn add_read_rate(&self, bytes: i64) {
     if bytes < 0 {
-      *self.count.lock().unwrap() -= bytes.abs() as u64;
+      *self.read_rate.lock().unwrap() -= bytes.abs() as u64;
     } else {
-      *self.count.lock().unwrap() += bytes as u64;
+      *self.read_rate.lock().unwrap() += bytes as u64;
     }
   }
+
+  /// Add write usage. `bytes` could be positive or negative
+  fn add_write_rate(&self, bytes: i64) {
+    if bytes < 0 {
+      *self.write_rate.lock().unwrap() -= bytes.abs() as u64;
+    } else {
+      *self.write_rate.lock().unwrap() += bytes as u64;
+    }
+  }
+
+  /// Set if the usage rate should send usage data to the accounting system.
+  /// If `true`, the usage rate will send usage data to the accounting system.
   fn set_send_usage(&mut self, send_usage: bool) {
     self.send_usage = send_usage;
   }
 
-  fn set_username(&mut self, username: Option<Vec<u8>>) {
+  fn set_username(&mut self, username: Option<Bytes>) {
     self.username = username;
   }
 
-  // async fn update_usage_rate(&self, username: &Vec<u8>, read_bytes: u64, write_bytes: u64) {
-  //   self
-  //     .net_usage
-  //     .lock()
-  //     .await
-  //     .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes)
-  //     .await;
-  // }
-}
-
-impl Drop for ByteCount {
-  fn drop(&mut self) {
-    trace!("Destructing {}: {} bytes exchanged.", self.tag, self.get(),);
+  async fn cleanup(&mut self) {
+    trace!(
+      "Cleaning up {}: {} bytes exchanged.",
+      "ByteCount",
+      self.get(),
+    );
     trace!(
       "Send usage rate of user {} to the accounting system: {}",
       match self.username.clone() {
@@ -263,45 +266,34 @@ impl Drop for ByteCount {
       self.send_usage
     );
     if self.send_usage {
-      let read_bytes = if self.byte_type == 0 { self.get() } else { 0 };
-      let write_bytes = if self.byte_type == 1 { self.get() } else { 0 };
-      // match &self.username.clone() {
-      //   Some(username) => {
-      //     self
-      //       .net_usage
-      //       .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes);
-      //     // update_usage_rate(username.as_ptr() as *const c_char, read_bytes, write_bytes);
-      //   }
-      //   None => {
-      //     // update_usage_rate(std::ptr::null(), read_bytes, write_bytes);
-      //     self
-      //       .net_usage
-      //       .update_usage_rate(Bytes::from(Vec::new()), read_bytes, write_bytes);
-      //   }
-      // }
-      let username = self.username.clone(); // Clone self.username here
-      let mut net_usage = self.net_usage.clone(); // Clone self.net_usage here
+      let net_usage = self.get();
 
       tokio::spawn(async move {
-        match username {
-          Some(username) => {
-            match net_usage
-              .update_usage_rate(Bytes::from(username.clone()), read_bytes, write_bytes).await {
-                Ok(_) => (),
-                Err(err) => warn!("Failed to update usage rate for username {}: {}", String::from_utf8_lossy(&username), err),
-                          };
-            // update_usage_rate(username.as_ptr() as *const c_char, read_bytes, write_bytes);
-          }
-          None => {
-            // update_usage_rate(std::ptr::null(), read_bytes, write_bytes);
-            match net_usage
-              .update_usage_rate(Bytes::from(Vec::new()), read_bytes, write_bytes).await{
-                Ok(_) => (),
-                Err(err) => warn!("Failed to update usage rate for username None: {}", err),
-              };
-          }
+        async fn writer() {
+          println!("Writing...");
         }
+        writer().await;
       });
+      let ngc = self.netguard_client.clone();
+      if !ngc.is_authed() {
+        panic!("The netguard client is not authenticated during sending net-usage to the server")
+      }
+      match ngc.clone().add_net_usage(net_usage).await {
+        Err(e) => debug!("Failed to send usage rate to the accounting system: {}", e),
+        Ok(()) => debug!("Successfully sent usage rate to the accounting system"),
+      };
+    }
+  }
+}
+
+impl<'a, T: NetGuard + 'a, U: Cache<SocksAuth, Bytes> + 'a> Drop for ByteCount<T, U> {
+  fn drop(&mut self) {
+    let usage = self.get();
+    if usage.read_rate > 0 || usage.write_rate > 0 {
+      warn!(
+        "It seems usage-rate doesn't send to the accounting system correctly (ACCOUNTING_FAILED_ERR_0384): {}",
+        usage
+      )
     }
   }
 }

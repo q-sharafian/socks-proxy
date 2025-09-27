@@ -1,22 +1,20 @@
 // #![forbid(unsafe_code)]
 
-use crate::authentication::Authenticator;
-use crate::{DestChecking, DestType, NetUsage};
+use crate::cache::Cache;
+use crate::netguard::{NONE_SOCKS_AUTH, NetAddrType, NetGuard, SocksAuth};
+use crate::{NetGuardClient, cstream};
 use bytes::Bytes;
 use cstream::{CStream, StreamExt};
 use snafu::Snafu;
-use std::ffi::CString;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
-
-use crate::cstream;
 
 /// Version of socks
 const SOCKS_VERSION: u8 = 0x05;
@@ -127,6 +125,10 @@ pub enum ResponseCode {
   AddrTypeNotSupported = 0x08,
   #[snafu(display("Access to destination is forbidden for the user"))]
   DestForbidden = 0x09,
+  #[snafu(display(
+    "Raised error by outer services (like accounting system) or error during communicating by outer services."
+  ))]
+  OuterServiceError = 0x0A,
 }
 
 impl From<MerinoError> for ResponseCode {
@@ -202,19 +204,18 @@ pub enum AuthMethods {
   NoMethods = 0xFF,
 }
 
-pub struct Merino {
+pub struct Merino<T: NetGuard, U: Cache<SocksAuth, Bytes>> {
   listener: TcpListener,
   users: Arc<Vec<User>>,
   auth_methods: Arc<Vec<u8>>,
   // Timeout for connections
   timeout: Option<Duration>,
   is_smart_auth: bool,
-  authenticator: Arc<Mutex<Authenticator>>,
-  dest_checker: Arc<Mutex<DestChecking>>,
-  net_usage: NetUsage,
+  netguard: Arc<Mutex<T>>,
+  netguard_token_cache: Arc<Mutex<U>>,
 }
 
-impl Merino {
+impl<T: NetGuard + 'static, U: Cache<SocksAuth, Bytes> + 'static> Merino<T, U> {
   /// Create a new Merino instance
   pub async fn new(
     port: u16,
@@ -222,9 +223,8 @@ impl Merino {
     mut auth_methods: Vec<u8>,
     users: Vec<User>,
     timeout: Option<Duration>,
-    authenticator: Mutex<Authenticator>,
-    dest_checker: Mutex<DestChecking>,
-    net_usage: NetUsage,
+    netguard: T,
+    netguard_token_cache: U,
   ) -> io::Result<Self> {
     let is_smart_auth = auth_methods.contains(&(AuthMethods::SmartAuth as u8));
     if is_smart_auth {
@@ -235,12 +235,7 @@ impl Merino {
     }
     trace!(
       "Creating new Merino instance: ip:{}, port:{}, auth_methods:{:?}, users:{:?}, timeout:{:?}, is_smart_auth:{}",
-      ip,
-      port,
-      auth_methods,
-      users,
-      timeout,
-      is_smart_auth
+      ip, port, auth_methods, users, timeout, is_smart_auth
     );
 
     info!("Listening on {}:{}", ip, port);
@@ -250,9 +245,8 @@ impl Merino {
       users: Arc::new(users),
       timeout,
       is_smart_auth,
-      authenticator: Arc::new(authenticator),
-      dest_checker: Arc::new(dest_checker),
-      net_usage: net_usage,
+      netguard: Arc::new(Mutex::new(netguard)),
+      netguard_token_cache: Arc::new(Mutex::new(netguard_token_cache)),
     })
   }
 
@@ -263,22 +257,30 @@ impl Merino {
       let auth_methods = self.auth_methods.clone();
       let timeout = self.timeout.clone();
       let is_smart_auth = self.is_smart_auth.clone();
-      let mut cstream: CStream<TcpStream> = CStream::new(stream, false, &None, self.net_usage.clone());
+      let netguard_client = Arc::new(NetGuardClient::new(
+        self.netguard.clone(),
+        self.netguard_token_cache.clone(),
+      ));
+      let mut cstream: CStream<TcpStream, T, U> =
+        CStream::new(stream, false, None, netguard_client);
       if is_smart_auth {
         cstream.set_send_usage_data(true);
       }
-      let auth = self.authenticator.clone();
-      let dest_checker = self.dest_checker.clone();
+      let netguard = self.netguard.clone();
+      let netguard_token_cache = self.netguard_token_cache.clone();
       tokio::spawn(async move {
         // trace!("Created a new task to handle client: {}", client_addr);
+        let netguard_client = NetGuardClient::new(
+          netguard,
+          netguard_token_cache,
+        );
         let mut client = SocksClient::new(
           cstream,
-          users,
-          auth_methods,
+          users.clone(),
+          auth_methods.clone(),
           timeout,
           is_smart_auth,
-          auth,
-          dest_checker,
+          netguard_client,
         );
         match client.init().await {
           Ok(_) => {}
@@ -299,7 +301,11 @@ impl Merino {
   }
 }
 
-pub struct SocksClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static + StreamExt> {
+pub struct SocksClient<
+  T: AsyncRead + AsyncWrite + Send + Unpin + 'static + StreamExt,
+  U: Cache<SocksAuth, Bytes>,
+  V: NetGuard,
+> {
   stream: T,
   auth_nmethods: u8,
   auth_methods: Arc<Vec<u8>>,
@@ -307,13 +313,16 @@ pub struct SocksClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static + Stre
   socks_version: u8,
   timeout: Option<Duration>,
   is_smart_auth: bool,
-  authenticator: Arc<Mutex<Authenticator>>,
-  dest_checker: Arc<Mutex<DestChecking>>,
+  netguard_client: Arc<Mutex<NetGuardClient<V, U>>>,
+  /// The details of the user is authenticated and sending request as a client
+  authed_user: Option<SocksAuth>,
 }
 
-impl<T> SocksClient<T>
+impl<T, U, V> SocksClient<T, U, V>
 where
   T: AsyncRead + AsyncWrite + Send + Unpin + StreamExt + 'static,
+  U: Cache<SocksAuth, Bytes>,
+  V: NetGuard,
 {
   /// Create a new SOCKClient
   pub fn new(
@@ -322,8 +331,7 @@ where
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
     is_smart_auth: bool,
-    authenticator: Arc<Mutex<Authenticator>>,
-    dest_checker: Arc<Mutex<DestChecking>>,
+    netguard_client: NetGuardClient<V, U>,
   ) -> Self {
     SocksClient {
       stream,
@@ -333,12 +341,12 @@ where
       auth_methods,
       timeout,
       is_smart_auth,
-      authenticator,
-      dest_checker,
+      netguard_client: Arc::new(Mutex::new(netguard_client)),
+      authed_user: None,
     }
   }
 
-  pub fn set_username(&mut self, username: Option<Vec<u8>>) {
+  pub fn set_username(&mut self, username: Option<Bytes>) {
     self.stream.set_username(username);
   }
 
@@ -346,8 +354,7 @@ where
   pub fn new_no_auth(
     stream: T,
     timeout: Option<Duration>,
-    auth: Arc<Mutex<Authenticator>>,
-    dest_checker: Arc<Mutex<DestChecking>>,
+    netguard_client: NetGuardClient<V, U>,
   ) -> Self {
     // FIXME: use option here
     let authed_users: Arc<Vec<User>> = Arc::new(Vec::new());
@@ -363,8 +370,8 @@ where
       auth_methods,
       timeout,
       is_smart_auth: false,
-      authenticator: auth,
-      dest_checker: dest_checker,
+      netguard_client: Arc::new(Mutex::new(netguard_client)),
+      authed_user: None,
     }
   }
 
@@ -395,22 +402,24 @@ where
 
     trace!(
       "Version: {} Auth nmethods: {}",
-      self.socks_version,
-      self.auth_nmethods
+      self.socks_version, self.auth_nmethods
     );
 
     match self.socks_version {
       SOCKS_VERSION => {
         // Authenticate w/ client
-        let username = self.auth().await?;
+        self.authed_user = self.auth().await?;
+        let username = match &self.authed_user {
+          None => "None".bytes().collect(),
+          Some(u) => u.username.clone(),
+        };
+
         trace!(
           "Setting socks-client username to {:?}",
-          String::from_utf8(username.clone().unwrap_or_else(|| "None".bytes().collect()))
-            .unwrap_or_else(|_| "parse-error".to_string())
+          String::from_utf8(username.to_vec()).unwrap_or_else(|_| "parse-error".to_string())
         );
-        self.set_username(username.clone());
         // Handle requests
-        self.handle_client(username).await?;
+        self.handle_client().await?;
       }
       _ => {
         warn!("Init: Unsupported version: SOCKS{}", self.socks_version);
@@ -421,8 +430,18 @@ where
     Ok(())
   }
 
-  // Return user if the auth method is userpass
-  async fn auth(&mut self) -> Result<Option<Vec<u8>>, MerinoError> {
+  /// Authenticate a client
+  ///
+  /// If the client supports User/Password authentication, we will read the username and password
+  /// from the stream and check if the username and password are valid. If smart authentication is enabled,
+  /// we will use the outer services (like accounting system) to authenticate the user. If the user is
+  /// authenticated, we will send a success response to the client. If the user is not authenticated,
+  /// we will send a failure response to the client.
+  ///
+  /// If the client does not support User/Password authentication, we will send a NOAUTH packet to the client.
+  /// If the client supports NOAUTH, we will send a success response to the client. If the client does not support
+  /// NOAUTH, we will send a failure response to the client and shutdown the connection.
+  async fn auth(&mut self) -> Result<Option<SocksAuth>, MerinoError> {
     debug!("Authenticating");
     // Get valid auth methods
     let methods = self.get_avalible_methods().await?;
@@ -433,7 +452,6 @@ where
     // Set the version in the response
     response[0] = SOCKS_VERSION;
 
-    let mut username_vec: Option<Vec<u8>> = Option::None;
     if methods.contains(&(AuthMethods::UserPass as u8)) {
       // Set the default auth method (NO AUTH)
       response[1] = AuthMethods::UserPass as u8;
@@ -451,7 +469,8 @@ where
       // Username parsing
       let ulen = header[1] as usize;
 
-      username_vec = Some(vec![0; ulen]);
+      // let mut username_vec: Option<Vec<u8>> = Option::None;
+      let mut username_vec = Some(vec![0; ulen]);
       let inner_vec = username_vec.as_mut().unwrap();
       self.stream.read_exact(inner_vec).await?;
 
@@ -464,34 +483,33 @@ where
 
       let username = String::from_utf8_lossy(&mut username_vec.clone().unwrap()).to_string();
       let password = String::from_utf8_lossy(&password).to_string();
-      let user = User { username, password };
+      let user = User {
+        username: username.clone(),
+        password: password.clone(),
+      };
 
       let mut smart_auth_success = false;
       if self.is_smart_auth {
         debug!("Smart Authenticating...");
-        let username_c = CString::new(user.username.clone()).unwrap();
-        let password_bytes = user.password.as_bytes();
-        let auth_result = unsafe {
-          self
-            .authenticator
-            .clone()
-            .lock()
-            .unwrap()
-            .check(&*username_c.into_raw(), password_bytes)
-        };
+        let auth_result = self
+          .netguard_client.clone().lock().await
+          .authenticate(SocksAuth {
+            username: username.clone().into(),
+            password: password.clone().into(),
+          })
+          .await;
         trace!("Smart auth result: {:?}", auth_result);
 
-        if auth_result.is_err()
-          || auth_result.clone().unwrap().is_none()
-          || !auth_result.clone().unwrap().unwrap().authenticated
-        {
-          response[1] = AuthMethods::NoMethods as u8;
-          self.stream.write_all(&response).await?;
-          self.shutdown().await?;
-          return Err(MerinoError::Socks(ResponseCode::Failure));
+        match auth_result {
+          Ok(_) => smart_auth_success = true,
+          Err(error) => {
+            debug!("Smart auth failed for user {}: {}", user.username, error);
+            response[1] = AuthMethods::NoMethods as u8;
+            self.stream.write_all(&response).await?;
+            self.shutdown().await?;
+            return Err(MerinoError::Socks(ResponseCode::Failure));
+          }
         }
-
-        smart_auth_success = auth_result.unwrap().unwrap().authenticated;
       }
 
       // Authenticate passwords
@@ -506,24 +524,17 @@ where
         // Shutdown
         self.shutdown().await?;
       }
-      return Ok(username_vec);
+      return Ok(Some(SocksAuth {
+        username: username.into(),
+        password: password.into(),
+      }));
     } else if methods.contains(&(AuthMethods::NoAuth as u8)) {
       if self.is_smart_auth {
-        debug!("Smart Authenticating...");
-        let auth_result = unsafe {
-          self
-            .authenticator
-            .clone()
-            .lock()
-            .unwrap()
-            .check(&*CString::new("").unwrap().into_raw(), &[] as &[u8])
-        };
+        debug!("Smart Authenticating (No Auth)...");
+        let auth_result = self.netguard_client.clone().lock().await.authenticate(NONE_SOCKS_AUTH).await;
         trace!("Smart auth result: {:?}", auth_result);
 
-        if auth_result.is_err()
-          || auth_result.clone().unwrap().is_none()
-          || !auth_result.clone().unwrap().unwrap().authenticated
-        {
+        if auth_result.is_err() {
           response[1] = AuthMethods::NoMethods as u8;
           self.stream.write_all(&response).await?;
           // self.shutdown().await?;
@@ -546,29 +557,29 @@ where
   }
 
   /// Handles a client
-  pub async fn handle_client(&mut self, username: Option<Vec<u8>>) -> Result<usize, MerinoError> {
+  pub async fn handle_client(&mut self) -> Result<usize, MerinoError> {
     debug!("Starting to relay data");
 
-    let mut req = SOCKSReq::from_stream(&mut self.stream).await?;
+    let req = SOCKSReq::from_stream(&mut self.stream).await?;
 
     if req.addr_type == AddrType::V6 {}
 
     // Log Request
     let displayed_addr = pretty_print_addr(&req.addr_type, &req.addr);
     info!(
-      "New Request: Command: {:?} Addr: {}, Port: {}",
+      "New Request: Command: {:?}, Addr: {}, Port: {}",
       req.command, displayed_addr, req.port
     );
 
     // Check if the user could have access to the destination address
     let addr_type = match req.addr_type {
-      AddrType::V4 => DestType::IPV4(Ipv4Addr::new(
+      AddrType::V4 => NetAddrType::IPV4(Ipv4Addr::new(
         req.addr[0],
         req.addr[1],
         req.addr[2],
         req.addr[3],
       )),
-      AddrType::V6 => DestType::IPV6(Ipv6Addr::new(
+      AddrType::V6 => NetAddrType::IPV6(Ipv6Addr::new(
         u16::from(req.addr[0]) << 8 | u16::from(req.addr[1]),
         u16::from(req.addr[2]) << 8 | u16::from(req.addr[3]),
         u16::from(req.addr[4]) << 8 | u16::from(req.addr[5]),
@@ -578,28 +589,28 @@ where
         u16::from(req.addr[12]) << 8 | u16::from(req.addr[13]),
         u16::from(req.addr[14]) << 8 | u16::from(req.addr[15]),
       )),
-      AddrType::Domain => DestType::Domain(Bytes::from(req.addr.clone())),
+      AddrType::Domain => NetAddrType::Domain(Bytes::from(req.addr.clone())),
     };
-    let has_access = self.dest_checker.lock();
+    let authed_user = match &self.authed_user {
+      Some(user) => user.clone(),
+      None => {
+        trace!("There is no authed user");
+        return Err(MerinoError::Socks(ResponseCode::RuleFailure));
+      }
+    };
+    let has_access = self
+      .netguard_client.clone().lock().await
+      .is_allowed(authed_user.clone(), addr_type.clone())
+      .await;
+    // trace!("Has access: {}", has_access.clone().unwrap());
     if let Err(e) = has_access {
-      debug!("Failed to lock dest checker: {}", e);
-      return Err(MerinoError::Socks(ResponseCode::Failure));
+      debug!("Failed to check access: {}", e);
+      return Err(MerinoError::Socks(ResponseCode::OuterServiceError));
     }
-    let has_access = has_access.unwrap().has_access(
-      match username.clone() {
-        Some(un) => Bytes::copy_from_slice(un.as_slice()),
-        None => Bytes::new(),
-      },
-      addr_type.clone(),
-    );
-    if !has_access {
-      let username_str = match username.clone() {
-        Some(un) => String::from_utf8_lossy(&un).to_string(),
-        None => "None".to_string(),
-      };
+    if !has_access.unwrap() {
       trace!(
         "The user '{}' doesn't have access to the dest {:?}",
-        username_str,
+        authed_user.username2string(),
         addr_type
       );
       return Err(MerinoError::Socks(ResponseCode::DestForbidden));

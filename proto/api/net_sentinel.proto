@@ -1,0 +1,98 @@
+// This file defines the gRPC service.
+
+syntax = "proto3";
+
+package net_sentinel;
+
+// The go_package option is crucial for Go. It specifies the import path
+// for the generated Go code.
+option go_package = "hamgit.ir/zirabro/net-sentinel/pkg/grpc/gen/net_sentinel";
+
+service NetSentinel {
+  // Add net-usage to the database. (After caching and other operations)
+  rpc AddNetUsage (AddNetUsageRequest) returns (AddNetUsageResponse) {}
+  // Return true if the user is allowed to access the specified net address.
+  rpc IsAllowed (IsAllowedRequest) returns (IsAllowedResponse) {}
+  // Validate given auth token.
+	// First return value is true if user is allowed to use the proxy method.
+	// The second return value is the user ID.
+  rpc ValidateAuthToken (ValidateAuthRequest) returns (ValidateAuthResponse) {}
+  // Check if such user exists that be allowed to use the specified proxy method service.
+	// Then return auth token for the user.
+  rpc GenerateAuthToken (GenerateAuthRequest) returns (GenerateAuthResponse) {}
+}
+
+// All necessary info must be providced in the token (like net method)
+message AuthToken {
+  string token = 1;
+}
+
+enum NetMethod {
+  NET_METHOD_SOCKS5 = 0;
+}
+
+enum NetAddressType {
+  NET_ADDRESS_IPV4 = 0;
+  NET_ADDRESS_IPV6 = 1;
+  NET_ADDRESS_DOMAIN = 2;
+}
+
+enum ResultStatus {
+  RESULT_STATUS_SUCCESS = 0;
+  RESULT_STATUS_ERROR = 1;
+  RESULT_STATUS_AUTH_FAILED = 2;
+}
+
+message NetAddress {
+  string address = 1;
+  NetAddressType type = 2;
+}
+
+message AuthSocks5 {
+  string username = 1;
+  string password = 2;
+}
+
+message ValidateAuthRequest {
+  AuthToken auth_token = 1;
+}
+
+message ValidateAuthResponse {
+  ResultStatus status = 1;
+  bool allowed = 2;
+  string message = 3; // error message if the operation failed. Otehrwise success message.
+}
+
+message GenerateAuthRequest {
+  oneof state {
+    AuthSocks5 socks5 = 1;    
+  }
+}
+
+message GenerateAuthResponse {
+  ResultStatus status = 1;
+  string token = 2; // generated auth token
+  string message = 3; // error message if the operation failed. Otehrwise success message.
+}
+
+message IsAllowedRequest {
+  AuthToken auth_token = 1;
+  NetAddress address = 3;
+}
+
+message IsAllowedResponse {
+  ResultStatus status = 1;
+  bool allowed = 2;
+  string message = 3; // error message if the operation failed. Otehrwise success message.
+}
+// The request message containing the user's name.
+message AddNetUsageRequest {
+  AuthToken auth_token = 1;
+  uint64 upload_usage = 3; // In bytes
+  uint64 download_usage = 4; // In bytes
+}
+
+message AddNetUsageResponse {
+  ResultStatus status = 1;
+  string message = 2; // error message if the operation failed. Otehrwise success message.
+}

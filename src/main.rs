@@ -1,17 +1,21 @@
-#![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), deny(warnings))]
 #![warn(clippy::all, rust_2018_idioms)]
 #[macro_use]
 extern crate log;
 
+use bytes::Bytes;
 use clap::{ArgGroup, Parser, ValueEnum};
+use hyper_util::rt::tokio::TokioIo;
+use merino::cache::LruCache;
+use merino::netguard::SocksAuth;
 use merino::*;
-use std::env;
 use std::error::Error;
 use std::os::unix::prelude::MetadataExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tokio::sync::Mutex as TokioMutex;
+use std::{env, str::FromStr};
+use tokio::net::UnixStream;
+use tonic::transport::{Endpoint, Uri};
+use tower::service_fn;
 
 /// Logo to be printed at when merino is run
 const LOGO: &str = r"
@@ -77,7 +81,7 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
   dotenv::dotenv().ok();
-  
+
   println!("{}", LOGO);
 
   let opt = Opt::parse();
@@ -90,7 +94,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
       2 => "merino=TRACE",
       _ => "merino=INFO",
     };
-    env::set_var("RUST_LOG", level);
+    unsafe {
+      env::set_var("RUST_LOG", level);
+    }
   }
 
   if !opt.quiet {
@@ -106,7 +112,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
   }
 
   // Setup Proxy settings
-
   let mut auth_methods: Vec<u8> = Vec::new();
 
   // Allow unauthenticated connections
@@ -169,11 +174,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
   }
 
+  // Setup gRPC server
   let authed_users = authed_users?;
+  let uds_path_str = env::var("UDS_PATH").unwrap();
+  let uds_path = PathBuf::from(uds_path_str);
+  let dummy_uri = env::var("GRPC_DUMMY_URI").unwrap();
+  let channel = Endpoint::from(Uri::from_str(dummy_uri.as_str()).unwrap())
+    .connect_with_connector(service_fn(move |_: Uri| {
+      let uds_path_clone = uds_path.clone(); // Clone path for the async block
+      // Connect to the UDS path
+      async move {
+        match UnixStream::connect(uds_path_clone.clone()).await {
+          Ok(stream) => {
+            debug!("Client UDS: Successfully connected to {:?}", uds_path_clone);
+            Ok(TokioIo::new(stream))
+          }
+          Err(e) => {
+            error!(
+              "Client UDS: Failed to connect to {:?}: {}",
+              uds_path_clone, e
+            );
+            Err(e)
+          }
+        }
+      }
+    }))
+    .await?;
 
-  let authenticator = Authenticator::new();
-  let dest_checker = DestChecking::new();
-  let net_usage = NetUsage::new();
+  // Init net-guard
+  let netguard = netguard::DummyNetGuard::new();
+  let netguard_token_cache: LruCache<SocksAuth, Bytes> = LruCache::new(1000);
+
   // Create proxy server
   let mut merino = Merino::new(
     opt.port,
@@ -181,12 +212,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     auth_methods,
     authed_users,
     None,
-    Mutex::new(authenticator),
-    Mutex::new(dest_checker),
-    net_usage,
+    netguard,
+    netguard_token_cache,
   )
   .await?;
+
   // Start Proxies
   merino.serve().await;
+
   Ok(())
 }

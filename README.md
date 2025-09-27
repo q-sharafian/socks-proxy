@@ -43,12 +43,10 @@ cd merino
 cargo install --path .
 ```
 
-OR
-
-```bash
-LD_LIBRARY_PATH=~/Development/req-processor/target cargo build --release
-```
-
+OR do the following:  
+1) Set env vars
+2) run `cargo build` or `cargo build --release`
+3) Run `RUST_LOG=trace LD_LIBRARY_PATH=~/Development/req-processor/target/release ./target/debug/merino --auth-type smart-auth` or `./target/debug/merino --auth-type smart-auth`
 OR
 
 ```bash
