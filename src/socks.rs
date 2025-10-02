@@ -257,30 +257,24 @@ impl<T: NetGuard + 'static, U: Cache<SocksAuth, Bytes> + 'static> Merino<T, U> {
       let auth_methods = self.auth_methods.clone();
       let timeout = self.timeout.clone();
       let is_smart_auth = self.is_smart_auth.clone();
-      let netguard_client = Arc::new(NetGuardClient::new(
-        self.netguard.clone(),
-        self.netguard_token_cache.clone(),
-      ));
+      let netguard_client =
+        NetGuardClient::new(self.netguard.clone(), self.netguard_token_cache.clone());
+      let arc_netguard_client = Arc::new(netguard_client);
+      let mutex_netguard_client = Arc::new(Mutex::new((*arc_netguard_client).clone()));
       let mut cstream: CStream<TcpStream, T, U> =
-        CStream::new(stream, false, None, netguard_client);
+        CStream::new(stream, false, None, arc_netguard_client.clone());
       if is_smart_auth {
         cstream.set_send_usage_data(true);
       }
-      let netguard = self.netguard.clone();
-      let netguard_token_cache = self.netguard_token_cache.clone();
       tokio::spawn(async move {
         // trace!("Created a new task to handle client: {}", client_addr);
-        let netguard_client = NetGuardClient::new(
-          netguard,
-          netguard_token_cache,
-        );
         let mut client = SocksClient::new(
           cstream,
           users.clone(),
           auth_methods.clone(),
           timeout,
           is_smart_auth,
-          netguard_client,
+          mutex_netguard_client,
         );
         match client.init().await {
           Ok(_) => {}
@@ -331,7 +325,7 @@ where
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
     is_smart_auth: bool,
-    netguard_client: NetGuardClient<V, U>,
+    netguard_client: Arc<Mutex<NetGuardClient<V, U>>>,
   ) -> Self {
     SocksClient {
       stream,
@@ -341,7 +335,7 @@ where
       auth_methods,
       timeout,
       is_smart_auth,
-      netguard_client: Arc::new(Mutex::new(netguard_client)),
+      netguard_client: netguard_client,
       authed_user: None,
     }
   }
@@ -354,7 +348,7 @@ where
   pub fn new_no_auth(
     stream: T,
     timeout: Option<Duration>,
-    netguard_client: NetGuardClient<V, U>,
+    netguard_client: Arc<Mutex<NetGuardClient<V, U>>>,
   ) -> Self {
     // FIXME: use option here
     let authed_users: Arc<Vec<User>> = Arc::new(Vec::new());
@@ -370,7 +364,7 @@ where
       auth_methods,
       timeout,
       is_smart_auth: false,
-      netguard_client: Arc::new(Mutex::new(netguard_client)),
+      netguard_client: netguard_client,
       authed_user: None,
     }
   }
@@ -492,7 +486,10 @@ where
       if self.is_smart_auth {
         debug!("Smart Authenticating...");
         let auth_result = self
-          .netguard_client.clone().lock().await
+          .netguard_client
+          .clone()
+          .lock()
+          .await
           .authenticate(SocksAuth {
             username: username.clone().into(),
             password: password.clone().into(),
@@ -531,8 +528,14 @@ where
     } else if methods.contains(&(AuthMethods::NoAuth as u8)) {
       if self.is_smart_auth {
         debug!("Smart Authenticating (No Auth)...");
-        let auth_result = self.netguard_client.clone().lock().await.authenticate(NONE_SOCKS_AUTH).await;
-        trace!("Smart auth result: {:?}", auth_result);
+        let auth_result = self
+          .netguard_client
+          .clone()
+          .lock()
+          .await
+          .authenticate(NONE_SOCKS_AUTH)
+          .await;
+        trace!("Smart auth result (No Auth): {:?}", auth_result);
 
         if auth_result.is_err() {
           response[1] = AuthMethods::NoMethods as u8;
@@ -594,12 +597,20 @@ where
     let authed_user = match &self.authed_user {
       Some(user) => user.clone(),
       None => {
-        trace!("There is no authed user");
-        return Err(MerinoError::Socks(ResponseCode::RuleFailure));
+        if self.auth_methods.contains(&(AuthMethods::NoAuth as u8)) {
+          trace!("No authed user and the no-auth method is allowed.");
+          NONE_SOCKS_AUTH
+        } else {
+          trace!("There is no authed user. The no-auth method is not allowed.");
+          return Err(MerinoError::Socks(ResponseCode::RuleFailure));
+        }
       }
     };
     let has_access = self
-      .netguard_client.clone().lock().await
+      .netguard_client
+      .clone()
+      .lock()
+      .await
       .is_allowed(authed_user.clone(), addr_type.clone())
       .await;
     // trace!("Has access: {}", has_access.clone().unwrap());

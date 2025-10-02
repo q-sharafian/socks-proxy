@@ -5,8 +5,6 @@ use thiserror::Error;
 use std::{fmt::Display, net::{Ipv4Addr, Ipv6Addr}};
 use std::future::Future;
 use std::hash::Hash;
-use std::hash::Hasher;
-use std::collections::HashMap;
 
 #[derive(Debug, Error)]
 pub enum NetGuardError {
@@ -22,7 +20,7 @@ pub enum NetGuardError {
   InternalError(String)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetUsage {
   /// In bytes
   pub read_rate: u64,
@@ -59,6 +57,12 @@ pub struct SocksAuth {
   pub password: Bytes
 }
 
+impl Display for SocksAuth {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "username: {}, password: {}", self.username2string(), "*****")
+  }
+}
+
 pub const NONE_SOCKS_AUTH: SocksAuth = SocksAuth {
   username: Bytes::new(),
   password: Bytes::new()
@@ -71,7 +75,7 @@ impl SocksAuth {
 }
 
 /// The implementation of this trait should be thread-safe.
-pub trait NetGuard: Send + Sync {
+pub trait NetGuard: Send + Sync + Clone + 'static {
   /// Generate authentication token.
   ///
   /// ## Some possible errors:
@@ -100,7 +104,7 @@ pub trait NetGuard: Send + Sync {
   /// - InternalError
   /// - LimitReached
   /// - AuthTokenExpired
-  async fn set_net_usage(&mut self, token: &Bytes, net_usage: NetUsage) -> Result<(), NetGuardError>;
+  fn set_net_usage(&mut self, token: &Bytes, net_usage: NetUsage) -> impl Future<Output = Result<(), NetGuardError>> + std::marker::Send;
 }
 
 pub use dummy_netguard::DummyNetGuard;

@@ -3,6 +3,7 @@ use crate::netguard::{NetAddrType, NetGuard, NetGuardError, NetUsage, SocksAuth}
 
 /// This implementation does not raise any errors in either method (assuming success upon 
 /// running) and is useful for testing.
+#[derive(Clone)]
 pub struct DummyNetGuard {}
 
 impl NetGuard for DummyNetGuard {

@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+rand = "0.9.2"
 bytes = "1.10.1"
 clap = { version = "4.5.0", features = ["derive"] }
 csv = "1.1.6"

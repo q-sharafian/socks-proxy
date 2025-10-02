@@ -5,17 +5,13 @@ extern crate log;
 
 use bytes::Bytes;
 use clap::{ArgGroup, Parser, ValueEnum};
-use hyper_util::rt::tokio::TokioIo;
 use merino::cache::LruCache;
 use merino::netguard::SocksAuth;
 use merino::*;
+use std::env;
 use std::error::Error;
 use std::os::unix::prelude::MetadataExt;
 use std::path::PathBuf;
-use std::{env, str::FromStr};
-use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
 
 /// Logo to be printed at when merino is run
 const LOGO: &str = r"
@@ -176,30 +172,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
   // Setup gRPC server
   let authed_users = authed_users?;
-  let uds_path_str = env::var("UDS_PATH").unwrap();
-  let uds_path = PathBuf::from(uds_path_str);
-  let dummy_uri = env::var("GRPC_DUMMY_URI").unwrap();
-  let channel = Endpoint::from(Uri::from_str(dummy_uri.as_str()).unwrap())
-    .connect_with_connector(service_fn(move |_: Uri| {
-      let uds_path_clone = uds_path.clone(); // Clone path for the async block
-      // Connect to the UDS path
-      async move {
-        match UnixStream::connect(uds_path_clone.clone()).await {
-          Ok(stream) => {
-            debug!("Client UDS: Successfully connected to {:?}", uds_path_clone);
-            Ok(TokioIo::new(stream))
-          }
-          Err(e) => {
-            error!(
-              "Client UDS: Failed to connect to {:?}: {}",
-              uds_path_clone, e
-            );
-            Err(e)
-          }
-        }
-      }
-    }))
-    .await?;
+  // let uds_path_str = env::var("UDS_PATH").unwrap();
+  // let uds_path = PathBuf::from(uds_path_str);
+  // let dummy_uri = env::var("GRPC_DUMMY_URI").unwrap();
+  // let channel = Endpoint::from(Uri::from_str(dummy_uri.as_str()).unwrap())
+  //   .connect_with_connector(service_fn(move |_: Uri| {
+  //     let uds_path_clone = uds_path.clone(); // Clone path for the async block
+  //     // Connect to the UDS path
+  //     async move {
+  //       match UnixStream::connect(uds_path_clone.clone()).await {
+  //         Ok(stream) => {
+  //           debug!("Client UDS: Successfully connected to {:?}", uds_path_clone);
+  //           Ok(TokioIo::new(stream))
+  //         }
+  //         Err(e) => {
+  //           error!(
+  //             "Client UDS: Failed to connect to {:?}: {}",
+  //             uds_path_clone, e
+  //           );
+  //           Err(e)
+  //         }
+  //       }
+  //     }
+  //   }))
+  //   .await?;
 
   // Init net-guard
   let netguard = netguard::DummyNetGuard::new();

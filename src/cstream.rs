@@ -7,8 +7,7 @@ use bytes::Bytes;
 use pin_project_lite::pin_project;
 use std::io::Result as IoResult;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -37,14 +36,10 @@ impl<'a, S, T: NetGuard, U: Cache<SocksAuth, Bytes>> CStream<S, T, U> {
   ) -> Self {
     let a = Self {
       inner,
-      usage_rate: ByteCount::new(
-        send_usage_data,
-        username.clone(),
-        netguard_client.clone(),
-      ),
+      usage_rate: ByteCount::new(send_usage_data, username.clone(), netguard_client.clone()),
       is_send_usage: send_usage_data,
       username: username,
-      netguard_client: netguard_client,
+      netguard_client: netguard_client.clone(),
     };
     a
   }
@@ -251,12 +246,11 @@ impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
     self.username = username;
   }
 
-  async fn cleanup(&mut self) {
-    trace!(
-      "Cleaning up {}: {} bytes exchanged.",
-      "ByteCount",
-      self.get(),
-    );
+  fn cleanup(&self)
+  where
+    T: 'static,
+    U: 'static,
+  {
     trace!(
       "Send usage rate of user {} to the accounting system: {}",
       match self.username.clone() {
@@ -268,32 +262,23 @@ impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
     if self.send_usage {
       let net_usage = self.get();
 
-      tokio::spawn(async move {
-        async fn writer() {
-          println!("Writing...");
-        }
-        writer().await;
-      });
-      let ngc = self.netguard_client.clone();
+      let ngc = &self.netguard_client;
       if !ngc.is_authed() {
-        panic!("The netguard client is not authenticated during sending net-usage to the server")
+        error!(
+          "The netguard client is not authenticated during sending net-usage to the server ({})",
+          ngc.is_authed()
+        )
       }
-      match ngc.clone().add_net_usage(net_usage).await {
+      match ngc.clone().sync_add_net_usage(net_usage.clone()) {
         Err(e) => debug!("Failed to send usage rate to the accounting system: {}", e),
         Ok(()) => debug!("Successfully sent usage rate to the accounting system"),
-      };
+      }
     }
   }
 }
 
-impl<'a, T: NetGuard + 'a, U: Cache<SocksAuth, Bytes> + 'a> Drop for ByteCount<T, U> {
+impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> Drop for ByteCount<T, U> {
   fn drop(&mut self) {
-    let usage = self.get();
-    if usage.read_rate > 0 || usage.write_rate > 0 {
-      warn!(
-        "It seems usage-rate doesn't send to the accounting system correctly (ACCOUNTING_FAILED_ERR_0384): {}",
-        usage
-      )
-    }
+    self.cleanup();
   }
 }

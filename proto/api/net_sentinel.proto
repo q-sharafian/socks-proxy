@@ -40,7 +40,10 @@ enum NetAddressType {
 enum ResultStatus {
   RESULT_STATUS_SUCCESS = 0;
   RESULT_STATUS_ERROR = 1;
+  // Authentication failed (duo to invalid token and etc. except the token is expired)
   RESULT_STATUS_AUTH_FAILED = 2;
+  // Authentication token is expired
+  RESULT_STATUS_AUTH_EXPIRED = 3;
 }
 
 message NetAddress {

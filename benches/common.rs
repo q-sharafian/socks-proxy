@@ -2,7 +2,6 @@
 extern crate test;
 
 use test::{Bencher, black_box};
-use merino::*;
 
 #[bench]
 fn bench_pow(b: &mut Bencher) {
