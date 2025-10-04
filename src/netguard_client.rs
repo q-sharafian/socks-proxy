@@ -3,20 +3,18 @@ use crate::netguard::{NONE_SOCKS_AUTH, NetAddrType, NetGuard, NetUsage, SocksAut
 use anyhow::Result;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 pub type NGClientCache<T> = Arc<Mutex<T>>;
 pub type NGClientNetGuard<T> = Arc<Mutex<T>>;
-use std::thread;
 
 /// Each connection has a NetGuardClient.
 #[derive(Debug, Clone)]
 pub struct NetGuardClient<T: NetGuard, U: Cache<SocksAuth, Bytes>> {
   netguard: NGClientNetGuard<T>,
-  auth: Option<SocksAuth>,
+  auth: Arc<Mutex<Option<SocksAuth>>>,
   /// Return true if the user has been authenticated at least once.
-  is_authed: bool,
+  is_authed: Arc<Mutex<bool>>,
   cache: NGClientCache<U>,
   /// Just used for testing purposes
   id: u32,
@@ -38,29 +36,29 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
   /// Create a new NetGuardClient.
   pub fn new(netguard: NGClientNetGuard<T>, cache: NGClientCache<U>) -> NetGuardClient<T, U> {
     NetGuardClient {
-      auth: None,
+      auth: Arc::new(Mutex::new(None)),
       netguard,
       cache,
-      is_authed: false,
+      is_authed: Arc::new(Mutex::new(false)),
       id: rand::random::<u32>(),
     }
   }
 
   /// Return true if the user has been authenticated at least once.
-  pub fn is_authed(&self) -> bool {
+  pub async fn is_authed(&self) -> bool {
+    let is_authed = self.is_authed.lock().await;
     trace!(
       "Checking is_authed for user '{}' (id: {}): {}",
-      if let Some(auth) = &self.auth {
+      if let Some(auth) = self.auth.lock().await.clone() {
         auth.username2string()
       } else {
         "None".to_string()
       },
       self.id,
-      self.is_authed
+      is_authed.clone()
     );
 
-    // self.is_authed
-    true
+    is_authed.clone()
   }
 
   /// Authenticate the user. If the user authneticated, return OK.
@@ -72,15 +70,15 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
     trace!("Authenticating user: '{}', id: {}", auth, self.id);
     if auth == NONE_SOCKS_AUTH {
       trace!("Authenticate with NONE_SOCKS_AUTH");
-      self.auth = Some(auth);
-      self.is_authed = true;
+      *self.auth.clone().lock().await = Some(auth);
+      *self.is_authed.clone().lock().await = true;
       return Ok(());
     }
 
     let c = self.cache.clone();
     if let Some(_token) = c.lock().await.get(auth.clone()).await {
-      self.auth = Some(auth);
-      self.is_authed = true;
+      *self.auth.clone().lock().await = Some(auth);
+      *self.is_authed.clone().lock().await = true;
     } else {
       let auth_token: Bytes;
       let result = self
@@ -109,8 +107,8 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
         .unwrap_or_else(|_| {
           trace!("Failed to put auth-token to the cache");
         });
-      self.auth = Some(auth);
-      self.is_authed = true;
+      *self.auth.clone().lock().await = Some(auth);
+      *self.is_authed.clone().lock().await = true;
     }
 
     Ok(())
@@ -121,7 +119,8 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
     auth: SocksAuth,
     net_type: NetAddrType,
   ) -> Result<bool, NetGuardClientError> {
-    if !self.is_authed {
+    let l: bool = (*self.is_authed.clone().lock().await).into();
+    if !l {
       return Err(NetGuardClientError::UserNotFound {
         username: String::from_utf8(auth.username.clone().to_vec())
           .unwrap_or_else(|_| "parse-error".to_string()),
@@ -155,7 +154,7 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
   }
 
   pub async fn add_net_usage(&self, net_usage: NetUsage) -> Result<(), NetGuardClientError> {
-    if self.is_authed() == false {
+    if self.is_authed().await == false {
       panic!(
         "The netguard client is not authenticated during sending net-usage to the server. (id: {})",
         self.id
@@ -168,7 +167,7 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
       .clone()
       .lock()
       .await
-      .get(self.auth.clone().unwrap())
+      .get(self.auth.clone().lock().await.clone().unwrap())
       .await
     {
       Some(t) => token = t,
@@ -178,7 +177,7 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
           .clone()
           .lock()
           .await
-          .generate_token(&self.auth.clone().unwrap())
+          .generate_token(&(self.auth.clone().lock().await.clone().unwrap()))
           .await;
         match result {
           Err(e) => return Err(NetGuardClientError::AuthFailed(e.to_string())),
@@ -201,7 +200,7 @@ impl<'a, T: NetGuard, U: Cache<SocksAuth, Bytes>> NetGuardClient<T, U> {
   }
 
   /// It's the same `add_net_usage` but it's syncronous call.
-  pub fn sync_add_net_usage(self: Arc<Self>, net_usage: NetUsage) -> Result<(), NetGuardClientError>
+  pub fn sync_add_net_usage(self, net_usage: NetUsage) -> Result<(), NetGuardClientError>
   where
     T: 'static,
     U: 'static,

@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Mutex as TokioMutex;
 
 pin_project! {
   /// Custom Stream
@@ -21,7 +22,18 @@ pin_project! {
     usage_rate: ByteCount<T, U>, // A service to send usage rate to the accounting system.
     is_send_usage: bool, // If true, send usage rate of data to the accounting system
     username: Option<Bytes>,
-    netguard_client: Arc<NetGuardClient<T, U>>,
+    netguard_client: Arc<TokioMutex<NetGuardClient<T, U>>>,
+  }
+}
+
+pub trait CleanUp {
+  fn cleanup(&self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl<S, T: NetGuard, U: Cache<SocksAuth, Bytes>> CleanUp for CStream<S, T, U> {
+  fn cleanup(&self) -> impl std::future::Future<Output = ()> + Send {
+    trace!("Cleaning up net usage...");
+    self.usage_rate.cleanup()
   }
 }
 
@@ -32,7 +44,7 @@ impl<'a, S, T: NetGuard, U: Cache<SocksAuth, Bytes>> CStream<S, T, U> {
     inner: S,
     send_usage_data: bool,
     username: Option<Bytes>,
-    netguard_client: Arc<NetGuardClient<T, U>>,
+    netguard_client: Arc<TokioMutex<NetGuardClient<T, U>>>,
   ) -> Self {
     let a = Self {
       inner,
@@ -193,14 +205,14 @@ struct ByteCount<T: NetGuard, U: Cache<SocksAuth, Bytes>> {
   username: Option<Bytes>,
   /// If true, send usage rate of data to the accounting system
   send_usage: bool,
-  netguard_client: Arc<NetGuardClient<T, U>>,
+  netguard_client: Arc<TokioMutex<NetGuardClient<T, U>>>,
 }
 
 impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
   fn new(
     send_usage: bool,
     username: Option<Bytes>,
-    netguard_client: Arc<NetGuardClient<T, U>>,
+    netguard_client: Arc<TokioMutex<NetGuardClient<T, U>>>,
   ) -> ByteCount<T, U> {
     ByteCount {
       read_rate: Mutex::new(0),
@@ -246,27 +258,30 @@ impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
     self.username = username;
   }
 
-  fn cleanup(&self)
+  async fn cleanup(&self)
   where
     T: 'static,
     U: 'static,
   {
+    let t = self;
     trace!(
-      "Send usage rate of user {} to the accounting system: {}",
-      match self.username.clone() {
+      "Send usage rate of user {} to the accounting system: {}. net-usage: {:?}",
+      match t.username.clone() {
         None => "None".to_string(),
         Some(username) => String::from_utf8_lossy(&username).to_string(),
       },
-      self.send_usage
+      t.send_usage,
+      t.get(),
     );
-    if self.send_usage {
-      let net_usage = self.get();
+    if t.send_usage {
+      let net_usage = t.get();
 
-      let ngc = &self.netguard_client;
-      if !ngc.is_authed() {
+      let ngc = t.netguard_client.lock().await;
+      let is_authed = ngc.is_authed().await;
+      if !is_authed {
         error!(
           "The netguard client is not authenticated during sending net-usage to the server ({})",
-          ngc.is_authed()
+          is_authed
         )
       }
       match ngc.clone().sync_add_net_usage(net_usage.clone()) {
@@ -279,6 +294,6 @@ impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> ByteCount<T, U> {
 
 impl<T: NetGuard, U: Cache<SocksAuth, Bytes>> Drop for ByteCount<T, U> {
   fn drop(&mut self) {
-    self.cleanup();
+    trace!("ByteCount dropped");
   }
 }

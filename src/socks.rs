@@ -1,6 +1,7 @@
 // #![forbid(unsafe_code)]
 
 use crate::cache::Cache;
+use crate::cstream::CleanUp;
 use crate::netguard::{NONE_SOCKS_AUTH, NetAddrType, NetGuard, SocksAuth};
 use crate::{NetGuardClient, cstream};
 use bytes::Bytes;
@@ -262,7 +263,7 @@ impl<T: NetGuard + 'static, U: Cache<SocksAuth, Bytes> + 'static> Merino<T, U> {
       let arc_netguard_client = Arc::new(netguard_client);
       let mutex_netguard_client = Arc::new(Mutex::new((*arc_netguard_client).clone()));
       let mut cstream: CStream<TcpStream, T, U> =
-        CStream::new(stream, false, None, arc_netguard_client.clone());
+        CStream::new(stream, false, None, mutex_netguard_client.clone());
       if is_smart_auth {
         cstream.set_send_usage_data(true);
       }
@@ -274,10 +275,11 @@ impl<T: NetGuard + 'static, U: Cache<SocksAuth, Bytes> + 'static> Merino<T, U> {
           auth_methods.clone(),
           timeout,
           is_smart_auth,
-          mutex_netguard_client,
+          mutex_netguard_client.clone(),
         );
         match client.init().await {
-          Ok(_) => {}
+          Ok(_) => {
+          }
           Err(error) => {
             error!("Error! {:?}, client: {:?}", error, client_addr);
 
@@ -314,7 +316,7 @@ pub struct SocksClient<
 
 impl<T, U, V> SocksClient<T, U, V>
 where
-  T: AsyncRead + AsyncWrite + Send + Unpin + StreamExt + 'static,
+  T: AsyncRead + AsyncWrite + Send + Unpin + StreamExt + CleanUp + 'static,
   U: Cache<SocksAuth, Bytes>,
   V: NetGuard,
 {
@@ -414,6 +416,7 @@ where
         );
         // Handle requests
         self.handle_client().await?;
+        self.stream.cleanup().await;
       }
       _ => {
         warn!("Init: Unsupported version: SOCKS{}", self.socks_version);

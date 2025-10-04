@@ -11,7 +11,7 @@ fn bench_pow(b: &mut Bencher) {
 
     b.iter(|| {
         // Inner closure, the actual test
-        for i in 1..100 {
+        for _i in 1..100 {
             black_box(x.powf(y).powf(x));
         }
     });
