@@ -76,6 +76,7 @@ message GenerateAuthResponse {
   ResultStatus status = 1;
   string token = 2; // generated auth token
   string message = 3; // error message if the operation failed. Otehrwise success message.
+  uint64 ttl = 4; // number of seconds the token is valid
 }
 
 message IsAllowedRequest {

@@ -15,7 +15,7 @@ impl DummyCache {
 
 impl<K, V: Send> Cache<K, V> for DummyCache
 where
-  K: 'static,
+  K: 'static + Send,
   V: 'static,
 {
   /// If occured any error or there is no value, returns None
